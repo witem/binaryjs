@@ -5,6 +5,7 @@
   "version": "0.2.3",
   "homepage": "http://binaryjs.com",
   "main": "lib/server.js",
+  "browser": "dist/binary.js",
   "scripts": {
     "test": "make test"
   },
