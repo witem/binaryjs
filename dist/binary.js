@@ -1,4 +1,4 @@
-/*! binary.js build:0.2.2, development. Copyright(c) 2012 Eric Zhang <eric@ericzhang.com> MIT Licensed */
+/*! binary.js build:0.2.3, development. Copyright(c) 2012 Eric Zhang <eric@ericzhang.com> MIT Licensed */
 (function(exports){
 /*! binarypack.js build:0.0.9, production. Copyright(c) 2012 Eric Zhang <eric@ericzhang.com> MIT Licensed */(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
 var BufferBuilder = require('./bufferbuilder').BufferBuilder;
@@ -1281,7 +1281,7 @@ BinaryStream.prototype._write = function(code, data, bonus) {
     return false;
   }
   var message = util.pack([code, data, bonus]);
-  return this._socket.send(message) !== false;
+  return this._socket.send(message, {binary: true}) !== false;
 };
 
 BinaryStream.prototype.write = function(data) {
@@ -1322,6 +1322,14 @@ BinaryStream.prototype._onData = function(data) {
   this.emit('data', data);
 };
 
+BinaryStream.prototype._onNotification = function(event) {
+  this.emit('notify', event);
+};
+
+BinaryStream.prototype.sendNotification = function(event) {
+  this._write(7, event, this.id);
+};
+
 BinaryStream.prototype.pause = function() {
   this._onPause();
   this._write(3, null, this.id);
@@ -1333,32 +1341,38 @@ BinaryStream.prototype.resume = function() {
 };
 
 
-function BinaryClient(socket, options) {
-  if (!(this instanceof BinaryClient)) return new BinaryClient(socket, options);
-  
+function BinaryClient(socket, options, wsOptions) {
+  if (!(this instanceof BinaryClient)) return new BinaryClient(socket, options, wsOptions);
+
   EventEmitter.call(this);
-  
+
   var self = this;
-  
+
   this._options = util.extend({
     chunkSize: 40960
   }, options);
-  
+
   this.streams = {};
-  
+
   if(typeof socket === 'string') {
     this._nextId = 0;
-    this._socket = new WebSocket(socket);
+    this._socket = new WebSocket(socket, wsOptions);
   } else {
     // Use odd numbered ids for server originated streams
     this._nextId = 1;
     this._socket = socket;
   }
-  
+
   this._socket.binaryType = 'arraybuffer';
-  
+
   this._socket.addEventListener('open', function(){
     self.emit('open');
+  });
+  this._socket.addEventListener('ping', function(data, flags){
+    self.emit('ping', data, flags);
+  });
+  this._socket.addEventListener('pong', function(data, flags){
+    self.emit('pong', data, flags);
   });
   this._socket.addEventListener('error', function(error){
     var ids = Object.keys(self.streams);
@@ -1376,40 +1390,46 @@ function BinaryClient(socket, options) {
   });
   this._socket.addEventListener('message', function(data, flags){
     util.setZeroTimeout(function(){
-  
+
       // Message format
       // [type, payload, bonus ]
       //
       // Reserved
       // [ 0  , X , X ]
-      // 
+      //
       //
       // New stream
       // [ 1  , Meta , new streamId ]
-      // 
+      //
       //
       // Data
       // [ 2  , Data , streamId ]
-      // 
+      //
       //
       // Pause
       // [ 3  , null , streamId ]
-      // 
+      //
       //
       // Resume
       // [ 4  , null , streamId ]
-      // 
+      //
       //
       // End
       // [ 5  , null , streamId ]
-      // 
+      //
       //
       // Close
       // [ 6  , null , streamId ]
-      // 
-      
+      //
+      // 7
+      // [ 7  , Notification , streamId ]
+      //
+      // 8
+      // [ 8  , Message ]
+      //
+
       data = data.data;
-      
+
       try {
           data = util.unpack(data);
       } catch (ex) {
@@ -1421,7 +1441,7 @@ function BinaryClient(socket, options) {
           return self.emit('error', new Error('Received message with wrong part count: ' + data.length));
       if ('number' != typeof data[0])
           return self.emit('error', new Error('Received message with non-number type: ' + data[0]));
-      
+
       switch(data[0]) {
         case 0:
           // Reserved
@@ -1478,6 +1498,20 @@ function BinaryClient(socket, options) {
             self.emit('error', new Error('Received `close` message for unknown stream: ' + streamId));
           }
           break;
+        case 7:
+          var streamId = data[2];
+          var binaryStream = self.streams[streamId];
+          if(binaryStream) {
+            var event = data[1];
+            binaryStream._onNotification(event);
+          } else {
+            self.emit('error', new Error('Received `notification` message for unknown stream: ' + streamId));
+          }
+          break;
+        case 8:
+          var message = data[1];
+          self.emit('message', message);
+          break;
         default:
           self.emit('error', new Error('Unrecognized message type received: ' + data[0]));
       }
@@ -1486,6 +1520,19 @@ function BinaryClient(socket, options) {
 }
 
 util.inherits(BinaryClient, EventEmitter);
+
+BinaryClient.prototype.ping = function(data){
+  return this._socket.ping(data, {}, true);
+}
+
+BinaryClient.prototype.pong = function(data){
+  return this._socket.pong(data, {}, true);
+}
+
+BinaryClient.prototype.sendMessage = function(message, cb){
+  var data = util.pack([8, message, 0]);
+  return this._socket.send(data, {binary: true}, cb);
+}
 
 BinaryClient.prototype.send = function(data, meta){
   var stream = this.createStream(meta);
@@ -1496,7 +1543,7 @@ BinaryClient.prototype.send = function(data, meta){
       (new BufferReadStream(data, {chunkSize: this._options.chunkSize})).pipe(stream);
     } else {
       stream.write(data);
-    } 
+    }
   } else if (util.isNode !== true) {
     if(data.constructor == Blob || data.constructor == File) {
       (new BlobReadStream(data, {chunkSize: this._options.chunkSize})).pipe(stream);
